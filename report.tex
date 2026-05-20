@@ -1,0 +1,117 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.65in]{geometry}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\setlist{nosep,leftmargin=*}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\title{\vspace{-2em}Assignment 4: Building Resilient Distributed Systems}
+\author{Abdul Basit \quad BSCS23023}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.8em}
+
+\section*{Part 1: Analysis of the Naive Architecture}
+StudySync fails because the MVP treats distributed calls as if they were local,
+instant, and reliable. The React client, FastAPI backend, database, Clerk, and LLM
+provider are independent systems connected by networks, so concurrent writes,
+dropped messages, and slow dependencies must be expected.
+
+\textbf{Synchronization.} The lost update occurs between the document read and
+write phases. Two users fetch the same document version from the API. Each edits
+locally and sends an update request. In a naive API, the backend writes the new
+body with no version check, lock, compare-and-swap operation, or conflict
+detection. Whichever request reaches the database last overwrites the earlier
+write, even though both users edited from the same stale snapshot.
+
+\textbf{Coordination.} Clerk webhooks coordinate subscription state by sending an
+event such as ``subscription cancelled'' to the backend. If the backend only
+updates the local user row when that HTTP webhook arrives, then Clerk is the
+source of truth but the application database becomes a fragile cache. A dropped
+webhook, timeout, or transient 500 can leave the app believing the user is still
+premium forever. Without idempotency, retries, reconciliation, or a dead-letter
+path, the system has no durable way to recover the missing state transition.
+
+\textbf{Fault tolerance.} The synchronous LLM request is a single point of
+failure because FastAPI waits on the external provider before completing the API
+response. If the provider hangs for 60 seconds, application workers are occupied
+waiting instead of serving other users. Under load, enough blocked requests can
+exhaust the server's concurrency budget, producing cascading latency and apparent
+application downtime even though the database and most app logic are healthy.
+
+\section*{Part 2: Better System Design}
+\textbf{Sync: optimistic locking.} Each document row stores a monotonically
+increasing version. The API returns the current version with every read. On
+update, the client sends the version it edited, for example through an
+\texttt{If-Match} header. The backend performs an atomic conditional update:
+\texttt{UPDATE documents SET body=?, version=version+1 WHERE id=? AND version=?}.
+If zero rows are updated, another writer already changed the document, so the API
+returns \texttt{409 Conflict} with the latest version. The user can reload, merge,
+or retry intentionally.
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  actor/.style={draw, rounded corners, minimum width=2.1cm, minimum height=.6cm},
+  msg/.style={-{Latex[length=2mm]}, thick},
+  note/.style={font=\small, fill=white, inner sep=2pt}
+]
+\node[actor] (a) at (0,0) {User A};
+\node[actor] (api) at (4,0) {FastAPI};
+\node[actor] (db) at (8,0) {Database};
+\node[actor] (b) at (12,0) {User B};
+
+\draw[dashed] (a) -- (0,-6.4);
+\draw[dashed] (api) -- (4,-6.4);
+\draw[dashed] (db) -- (8,-6.4);
+\draw[dashed] (b) -- (12,-6.4);
+
+\draw[msg] (0,-.8) -- node[note, above]{read document} (4,-.8);
+\draw[msg] (4,-1.3) -- node[note, above]{select doc v1} (8,-1.3);
+\draw[msg] (4,-1.8) -- node[note, above]{return v1} (0,-1.8);
+
+\draw[msg] (12,-2.4) -- node[note, above]{read document} (4,-2.4);
+\draw[msg] (4,-2.9) -- node[note, above]{select doc v1} (8,-2.9);
+\draw[msg] (4,-3.4) -- node[note, above]{return v1} (12,-3.4);
+
+\draw[msg] (0,-4.2) -- node[note, above]{update, If-Match: 1} (4,-4.2);
+\draw[msg] (4,-4.7) -- node[note, above]{compare-and-swap v1 to v2} (8,-4.7);
+\draw[msg] (8,-5.2) -- node[note, above]{success} (4,-5.2);
+
+\draw[msg] (12,-5.8) -- node[note, above]{update, If-Match: 1} (4,-5.8);
+\draw[msg] (4,-6.3) -- node[note, above]{CAS fails; current version is v2} (8,-6.3);
+\draw[msg] (4,-6.8) -- node[note, above]{409 Conflict} (12,-6.8);
+\end{tikzpicture}%
+}
+\end{center}
+
+\textbf{Coordination: reliable webhooks.} The webhook endpoint should verify the
+Clerk signature, persist the event id and payload before processing, and enforce a
+unique idempotency key on the Clerk event id. Processing then becomes safe to
+retry: duplicate deliveries return success without applying the cancellation
+twice. Failed events are retried with exponential backoff. After the retry budget
+is exhausted, the event is moved to a dead-letter queue for alerting and manual or
+automated replay. A scheduled reconciliation job should also compare local
+subscription state with Clerk so any permanently missed event is corrected.
+
+\textbf{Fault tolerance: circuit breaker.} The LLM client should use short
+timeouts and track recent failures. After repeated failures, the circuit opens and
+FastAPI immediately returns a fallback such as cached notes, a queued background
+job id, or a friendly ``AI summary temporarily unavailable'' response. After a
+cooldown, the breaker enters half-open state and allows one probe request. A
+successful probe closes the circuit; another failure reopens it. This prevents a
+slow dependency from consuming all API capacity.
+
+\textbf{CAP trade-offs.} For document editing, StudySync favors consistency over
+raw availability: stale writes are rejected with \texttt{409} so users do not lose
+work, at the cost of an extra reload or merge during conflicts. For webhooks, the
+system favors eventual consistency and availability by accepting Clerk events
+durably and retrying asynchronously. For the LLM feature, StudySync favors
+availability and low latency over perfect freshness by using fast fallbacks when
+the provider is unhealthy.
+
+\end{document}
