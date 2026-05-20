@@ -1,57 +1,77 @@
 \documentclass[10pt]{article}
-\usepackage[margin=0.65in]{geometry}
+\usepackage[margin=0.7in]{geometry}
 \usepackage{enumitem}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning}
-\setlist{nosep,leftmargin=*}
-\setlength{\parindent}{0pt}
-\setlength{\parskip}{4pt}
 
-\title{\vspace{-2em}Assignment 4: Building Resilient Distributed Systems}
+\setlist[itemize]{nosep,leftmargin=1.2em}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+\title{\vspace{-2em}\textbf{Assignment 4}\\Building Resilient Distributed Systems}
 \author{Abdul Basit \quad BSCS23023}
 \date{}
 
 \begin{document}
 \maketitle
-\vspace{-1.8em}
+\vspace{-1.6em}
 
-\section*{Part 1: Analysis of the Naive Architecture}
-StudySync fails because the MVP treats distributed calls as if they were local,
-instant, and reliable. The React client, FastAPI backend, database, Clerk, and LLM
-provider are independent systems connected by networks, so concurrent writes,
-dropped messages, and slow dependencies must be expected.
+\section*{1. Problems in the Basic StudySync Design}
 
-\textbf{Synchronization.} The lost update occurs between the document read and
-write phases. Two users fetch the same document version from the API. Each edits
-locally and sends an update request. In a naive API, the backend writes the new
-body with no version check, lock, compare-and-swap operation, or conflict
-detection. Whichever request reaches the database last overwrites the earlier
-write, even though both users edited from the same stale snapshot.
+The main weakness in the first StudySync design is that it assumes every remote
+service will behave like a local function call. In reality, the frontend,
+FastAPI service, database, Clerk authentication system, and LLM provider all run
+as separate networked components. Because of this, the system must be designed
+for delays, duplicate requests, missed messages, and failures instead of assuming
+that every operation will complete immediately and correctly.
 
-\textbf{Coordination.} Clerk webhooks coordinate subscription state by sending an
-event such as ``subscription cancelled'' to the backend. If the backend only
-updates the local user row when that HTTP webhook arrives, then Clerk is the
-source of truth but the application database becomes a fragile cache. A dropped
-webhook, timeout, or transient 500 can leave the app believing the user is still
-premium forever. Without idempotency, retries, reconciliation, or a dead-letter
-path, the system has no durable way to recover the missing state transition.
+\subsection*{1.1 Synchronization Problem}
 
-\textbf{Fault tolerance.} The synchronous LLM request is a single point of
-failure because FastAPI waits on the external provider before completing the API
-response. If the provider hangs for 60 seconds, application workers are occupied
-waiting instead of serving other users. Under load, enough blocked requests can
-exhaust the server's concurrency budget, producing cascading latency and apparent
-application downtime even though the database and most app logic are healthy.
+The document editing bug is caused by a classic lost-update situation. Both users
+load the same document state from the backend and begin editing from that old
+copy. When they submit their changes, the backend accepts each request without
+checking whether the document has already changed. As a result, the later
+database write replaces the earlier one. The first user's work is lost not
+because the database failed, but because the API has no version control,
+conditional write, locking, or conflict-handling mechanism.
 
-\section*{Part 2: Better System Design}
-\textbf{Sync: optimistic locking.} Each document row stores a monotonically
-increasing version. The API returns the current version with every read. On
-update, the client sends the version it edited, for example through an
-\texttt{If-Match} header. The backend performs an atomic conditional update:
-\texttt{UPDATE documents SET body=?, version=version+1 WHERE id=? AND version=?}.
-If zero rows are updated, another writer already changed the document, so the API
-returns \texttt{409 Conflict} with the latest version. The user can reload, merge,
-or retry intentionally.
+\subsection*{1.2 Coordination Problem}
+
+The subscription problem happens because the app depends completely on a Clerk
+webhook to update its own database. Clerk may know that a subscription was
+cancelled, but the local application only changes its user record after receiving
+and processing the webhook. If that HTTP request is dropped, times out, or fails
+with a temporary server error, the application can continue treating the user as
+premium. Without retry-safe processing, event storage, reconciliation, or a
+dead-letter process, there is no reliable path for the missed cancellation to be
+fixed.
+
+\subsection*{1.3 Fault-Tolerance Problem}
+
+The AI summary feature is fragile because the API waits directly for the external
+LLM provider before replying to the user. If the provider becomes very slow, each
+FastAPI worker remains blocked while waiting. When many users make requests at
+the same time, these blocked workers can consume the available server capacity.
+This can make the whole application feel unavailable even though only the LLM
+dependency is unhealthy.
+
+\section*{2. Improved Distributed-System Design}
+
+\subsection*{2.1 Safer Document Editing with Optimistic Locking}
+
+A better design is to attach a version number to every document. Each time a
+client reads a document, the API also returns the current version. When the
+client later sends an update, it must include the version it edited, such as in
+an \texttt{If-Match} header. The backend then performs one atomic conditional
+database update:
+
+\texttt{UPDATE documents SET body=?, version=version+1 WHERE id=? AND version=?}
+
+If the update changes one row, the client was editing the latest version and the
+save succeeds. If no row is changed, another user has already saved a newer
+version, so the API should return \texttt{409 Conflict}. The user can then reload,
+compare changes, merge, or retry deliberately instead of silently overwriting
+someone else's work.
 
 \begin{center}
 \resizebox{\textwidth}{!}{%
@@ -89,29 +109,49 @@ or retry intentionally.
 }
 \end{center}
 
-\textbf{Coordination: reliable webhooks.} The webhook endpoint should verify the
-Clerk signature, persist the event id and payload before processing, and enforce a
-unique idempotency key on the Clerk event id. Processing then becomes safe to
-retry: duplicate deliveries return success without applying the cancellation
-twice. Failed events are retried with exponential backoff. After the retry budget
-is exhausted, the event is moved to a dead-letter queue for alerting and manual or
-automated replay. A scheduled reconciliation job should also compare local
-subscription state with Clerk so any permanently missed event is corrected.
 
-\textbf{Fault tolerance: circuit breaker.} The LLM client should use short
-timeouts and track recent failures. After repeated failures, the circuit opens and
-FastAPI immediately returns a fallback such as cached notes, a queued background
-job id, or a friendly ``AI summary temporarily unavailable'' response. After a
-cooldown, the breaker enters half-open state and allows one probe request. A
-successful probe closes the circuit; another failure reopens it. This prevents a
-slow dependency from consuming all API capacity.
+\subsection*{2.2 Reliable Subscription Updates Through Webhook Handling}
 
-\textbf{CAP trade-offs.} For document editing, StudySync favors consistency over
-raw availability: stale writes are rejected with \texttt{409} so users do not lose
-work, at the cost of an extra reload or merge during conflicts. For webhooks, the
-system favors eventual consistency and availability by accepting Clerk events
-durably and retrying asynchronously. For the LLM feature, StudySync favors
-availability and low latency over perfect freshness by using fast fallbacks when
-the provider is unhealthy.
+Webhook processing should be made durable and retry-safe. The backend should
+first verify the Clerk signature, then store the event id and payload before
+applying any business logic. The Clerk event id should be treated as an
+idempotency key, so repeated deliveries of the same event do not cancel or modify
+the account more than once.
+
+If processing fails, the system should retry the event using exponential backoff.
+After repeated failures, the event should be placed in a dead-letter queue so it
+can be inspected, replayed, or handled manually. In addition, a scheduled
+reconciliation job should compare the app's subscription records with Clerk's
+current state. This ensures that even if a webhook is permanently missed, the
+local database can eventually be corrected.
+
+\subsection*{2.3 Protecting the API with a Circuit Breaker}
+
+The LLM integration should not be allowed to block the whole application. The
+FastAPI service should call the provider with short timeouts and monitor recent
+failures. If the provider repeatedly times out or fails, the circuit breaker
+should open. While it is open, the API should stop sending normal requests to the
+LLM and immediately return a safe fallback, such as cached notes, a queued job
+identifier, or a clear message that AI summaries are temporarily unavailable.
+
+After a cooldown period, the circuit can move into a half-open state and allow a
+small test request. If the test succeeds, normal traffic can resume. If it fails,
+the circuit opens again. This keeps the unhealthy provider from consuming all API
+capacity.
+
+\section*{3. CAP-Based Design Choices}
+
+StudySync does not need to make the same trade-off for every feature. For
+collaborative document editing, consistency is more important than accepting
+every write, so stale updates should be rejected with \texttt{409 Conflict}. This
+protects user work even though it may require a reload or merge.
+
+For subscription webhooks, the better approach is eventual consistency. The app
+should accept events durably and process them asynchronously, using retries and
+reconciliation to reach the correct state later.
+
+For the LLM summary feature, availability and fast response matter more than
+perfect freshness. If the AI provider is unhealthy, the system should keep the
+main app responsive by returning fallbacks instead of waiting indefinitely.
 
 \end{document}
